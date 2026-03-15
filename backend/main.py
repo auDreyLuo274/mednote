@@ -1,0 +1,220 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from typing import List, Optional, Any
+import sqlite3, json, os, hashlib, time
+
+app = FastAPI(title="MedNote API", version="1.0.0")
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Allow any origin so the HTML file works whether opened locally,
+# from GitHub Pages, or any other host.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── DATABASE ──────────────────────────────────────────────────────────────────
+DB_PATH = os.environ.get("DB_PATH", "mednote.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL DEFAULT 'User',
+            created_at  INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS visits (
+            id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            data        TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS reminders (
+            id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            data        TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ── MODELS ────────────────────────────────────────────────────────────────────
+class UserInit(BaseModel):
+    userId: str
+    name: Optional[str] = "User"
+
+class SyncPayload(BaseModel):
+    userId: str
+    visits: List[Any]
+    reminders: List[Any]
+
+class VisitPayload(BaseModel):
+    userId: str
+    visit: Any                  # single visit object
+
+class ReminderPayload(BaseModel):
+    userId: str
+    reminder: Any               # single reminder object
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def ensure_user(user_id: str, name: str = "User"):
+    conn = get_db()
+    exists = conn.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+    if not exists:
+        conn.execute(
+            "INSERT INTO users(id,name,created_at) VALUES(?,?,?)",
+            (user_id, name, int(time.time()))
+        )
+        conn.commit()
+    conn.close()
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "MedNote API"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ── User ──────────────────────────────────────────────────────────────────────
+@app.post("/api/user")
+def create_or_get_user(payload: UserInit):
+    """Create user if not exists, return user info."""
+    ensure_user(payload.userId, payload.name)
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE id=?", (payload.userId,)).fetchone()
+    conn.close()
+    return {"userId": row["id"], "name": row["name"], "createdAt": row["created_at"]}
+
+@app.get("/api/user/{user_id}")
+def get_user(user_id: str):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"userId": row["id"], "name": row["name"], "createdAt": row["created_at"]}
+
+# ── Full sync (push everything at once) ───────────────────────────────────────
+@app.post("/api/sync")
+def sync(payload: SyncPayload):
+    """
+    Replace all visits + reminders for a user.
+    Called on app load and after every significant change.
+    """
+    ensure_user(payload.userId)
+    conn = get_db()
+    now = int(time.time())
+
+    # Upsert every visit
+    conn.execute("DELETE FROM visits WHERE user_id=?", (payload.userId,))
+    for v in payload.visits:
+        conn.execute(
+            "INSERT INTO visits(id,user_id,data,updated_at) VALUES(?,?,?,?)",
+            (v.get("id", f"v{now}"), payload.userId, json.dumps(v), now)
+        )
+
+    # Upsert every reminder
+    conn.execute("DELETE FROM reminders WHERE user_id=?", (payload.userId,))
+    for r in payload.reminders:
+        conn.execute(
+            "INSERT INTO reminders(id,user_id,data,updated_at) VALUES(?,?,?,?)",
+            (str(r.get("id", now)), payload.userId, json.dumps(r), now)
+        )
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "synced": {"visits": len(payload.visits), "reminders": len(payload.reminders)}}
+
+# ── Pull all records ───────────────────────────────────────────────────────────
+@app.get("/api/records/{user_id}")
+def get_records(user_id: str):
+    """Fetch all visits + reminders for a user."""
+    conn = get_db()
+    visits   = [json.loads(r["data"]) for r in conn.execute(
+        "SELECT data FROM visits WHERE user_id=? ORDER BY updated_at DESC", (user_id,)
+    ).fetchall()]
+    reminders = [json.loads(r["data"]) for r in conn.execute(
+        "SELECT data FROM reminders WHERE user_id=? ORDER BY updated_at ASC", (user_id,)
+    ).fetchall()]
+    conn.close()
+    return {"visits": visits, "reminders": reminders}
+
+# ── Single visit CRUD ──────────────────────────────────────────────────────────
+@app.post("/api/visit")
+def save_visit(payload: VisitPayload):
+    ensure_user(payload.userId)
+    conn = get_db()
+    vid = payload.visit.get("id", f"v{int(time.time())}")
+    conn.execute(
+        "INSERT OR REPLACE INTO visits(id,user_id,data,updated_at) VALUES(?,?,?,?)",
+        (vid, payload.userId, json.dumps(payload.visit), int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": vid}
+
+@app.delete("/api/visit/{user_id}/{visit_id}")
+def delete_visit(user_id: str, visit_id: str):
+    conn = get_db()
+    conn.execute("DELETE FROM visits WHERE id=? AND user_id=?", (visit_id, user_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+# ── Single reminder CRUD ───────────────────────────────────────────────────────
+@app.post("/api/reminder")
+def save_reminder(payload: ReminderPayload):
+    ensure_user(payload.userId)
+    conn = get_db()
+    rid = str(payload.reminder.get("id", int(time.time())))
+    conn.execute(
+        "INSERT OR REPLACE INTO reminders(id,user_id,data,updated_at) VALUES(?,?,?,?)",
+        (rid, payload.userId, json.dumps(payload.reminder), int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": rid}
+
+@app.delete("/api/reminder/{user_id}/{reminder_id}")
+def delete_reminder(user_id: str, reminder_id: str):
+    conn = get_db()
+    conn.execute("DELETE FROM reminders WHERE id=? AND user_id=?", (reminder_id, user_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+# ── Serve frontend (optional — if you want one-server deployment) ──────────────
+# If RecallMD_web.html and RecallMD_v12.html are in a `static/` folder,
+# this serves them at /web and /mobile
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/web")
+    def serve_web():
+        return FileResponse(os.path.join(STATIC_DIR, "RecallMD_web.html"))
+
+    @app.get("/mobile")
+    def serve_mobile():
+        return FileResponse(os.path.join(STATIC_DIR, "RecallMD_v12.html"))
